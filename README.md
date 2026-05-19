@@ -1,108 +1,181 @@
 # Claude Intent Alignment Guard
 
-A Claude Code skill system that enforces intent alignment before every write, external action, or high-risk operation — without slowing down routine work.
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-green.svg)
+![Platform: Claude Code](https://img.shields.io/badge/Platform-Claude%20Code-blueviolet.svg)
 
-## What it does
-
-Before any consequential action, the guard asks: *did the user actually authorize this?* It does this at two layers:
-
-1. **The hook** (`hooks/pretool_intent_guard.py`) — a pattern-based `PreToolUse` hook that runs in <10ms before every `Bash`, `PowerShell`, `Edit`, and `Write` call. No LLM call. Classifies commands into four tiers and emits a directive.
-
-2. **The skills** — interactive Claude Code skills that run the full task-start protocol and manage permissions across four authorization planes.
+> **Did the user actually authorize this?**
+>
+> IAG answers that question before every write, push, delete, or external action — in under 10ms, with no LLM call.
 
 ---
 
-## Components
+## The problem it solves
 
-```
-├── skills/
-│   ├── intent-alignment-guard/SKILL.md   # Task-start protocol + action gate
-│   └── action-permissions/SKILL.md       # Permission lookup / grant / revoke
-├── hooks/
-│   └── pretool_intent_guard.py           # PreToolUse enforcement hook
-├── skill-permissions.template.json       # Per-skill authorization registry (template)
-└── settings-hook-snippet.json            # Hook registration for settings.json
-```
+Claude Code is powerful enough to push code, send Slack messages, delete files, and call external APIs — all in a single session. Without a guard, *ambiguous intent becomes unintended action*.
 
----
-
-## Tier Classification
-
-| Tier | Type | Hook behavior |
-|------|------|---------------|
-| 1 — Read-only | `git status`, `grep`, `Read`, `WebSearch` | Silent pass |
-| 2 — Reversible local write | `Edit`, `Write`, `git commit`, `mkdir` | Reminder emitted; proceed |
-| 3 — External / visible | `git push`, `gh pr`, Slack, external APIs | STOP directive; invoke IAG skill |
-| 4 — Destructive / irreversible | `rm -rf`, force push, `DROP TABLE` | **Blocked** (exit 2) |
-
-The hook also classifies by **file path** (sensitive paths like `.env`, `.ssh/`, `settings.json` escalate to Tier 3) and **content** (credential patterns in `new_string`/`content` escalate to Tier 3).
-
-Chain analysis splits `&&` / `;` / `||` and takes the **highest tier** across all segments.
+IAG inserts a structured consent layer between intent and execution. Routine read-only work passes silently. Consequential actions surface a gate. Destructive actions are blocked outright until you say so explicitly.
 
 ---
 
 ## How it works
 
-### Task-start (per task)
+```
+  User message
+       │
+       ▼
+┌─────────────────────────────────────────────────────────┐
+│  /intent-alignment-guard  (task-start)                  │
+│                                                         │
+│  5 questions · 1 AskUserQuestion call · no round-trip   │
+│                                                         │
+│  Q1 Task ── Q2 Scope ── Q3 Risk ── Q4 Routing ── Q5 Go  │
+│       └─ "Skip IAG" → bypass all checks immediately     │
+└──────────────────────────┬──────────────────────────────┘
+                           │  context summary always shown
+                           ▼
+                      Claude works
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+        Tier 1–2                    Tier 3–4
+        (local)                  (external / destructive)
+              │                         │
+        hook: silent            hook: STOP directive
+        or T2 reminder               │
+              │                   ┌───┴────────────────────┐
+              │                   │  Action Gate           │
+              │                   │  • What exactly        │
+              │                   │  • What authorized it  │
+              │                   │  • Alternatives tried  │
+              │                   └───┬────────────────────┘
+              │                       │
+              │              ┌────────┴────────┐
+              │              │                 │
+              │           ALLOW             BLOCK / ESCALATE
+              │              │
+              └──────────────┘
+                    Done
+```
 
-`/intent-alignment-guard` runs a 5-question interactive protocol in a **single `AskUserQuestion` call**:
+---
 
-- **Q1 Task** — 2–3 interpretations of what the user wants; includes a "Skip IAG" escape hatch
-- **Q2 Scope** — which files/systems are in scope
-- **Q3 Risk** — Tier 1/2 only vs. includes Tier 3/4
-- **Q4 Data Routing** — where output lands and its relationship to each destination
-- **Q5 Pathway** — Proceed / Proposal first / Skip guard
+## Tier classification
 
-If Q1 = "Skip IAG", the guard is bypassed entirely (hook still logs tier). Otherwise a context summary block is always shown before work begins.
+The hook (`hooks/pretool_intent_guard.py`) classifies every `Bash`, `PowerShell`, `Edit`, and `Write` call before it executes. No LLM call — pure regex pattern matching in <10ms.
 
-### Action gate (per Tier 2–4 action)
+| Tier | Label | Examples | Hook response |
+|:----:|-------|----------|---------------|
+| **1** | Read-only | `git status`, `grep`, `Read`, `WebSearch` | Silent pass |
+| **2** | Reversible local write | `Edit`, `Write`, `git commit`, `mkdir` | Reminder + proceed |
+| **3** | External / visible | `git push`, `gh pr`, Slack, external APIs | **STOP** — invoke IAG |
+| **4** | Destructive / irreversible | `rm -rf`, force push, `DROP TABLE` | **Blocked** (exit 2) |
 
-Before each consequential action during execution, an inline gate surfaces:
+**Three escalation paths beyond basic tier:**
+- **Sensitive paths** — `.env`, `.ssh/`, `settings.json` → auto-escalate to Tier 3
+- **Credential content** — API keys, JWTs, PEM keys in write payloads → auto-escalate to Tier 3
+- **Chain analysis** — `cmd1 && cmd2 ; cmd3` → highest tier across all segments wins
+
+---
+
+## Task-start protocol
+
+Every non-trivial task opens with a **single 5-question `AskUserQuestion` call** — no back-and-forth:
 
 ```
-• Action:     [exact action — Tier N label]
-• Authorized: [what in this conversation justifies it]
-• Skipped:    [lower-risk alternatives considered and rejected]
-• Mode:       [proposal / proceed]
+┌─ Q1: Task ──────────────────────────────────────────────┐
+│  2–3 context-derived interpretations of what you want   │
+│  + "Skip IAG" as a one-click bypass option              │
+├─ Q2: Scope ─────────────────────────────────────────────┤
+│  Specific files / vaults / systems inferred from context│
+├─ Q3: Risk ──────────────────────────────────────────────┤
+│  No external actions  /  Includes Tier 3/4  /  Not sure │
+├─ Q4: Data Routing ──────────────────────────────────────┤
+│  Where output lands + its relationship to each dest.    │
+└─ Q5: Pathway ───────────────────────────────────────────┘
+   Proceed on context  /  Proposal first  /  Skip guard
 ```
 
-### Permission planes (`/action-permissions`)
+A context summary block is always shown before work begins:
 
-The `action-permissions` sub-skill manages authorizations across four planes:
+```
+• Task:   [confirmed task]
+• Scope:  [confirmed files/systems]
+• Data:   [destination + relationship — input-to / stored-in / triggers]
+• Risks:  [Tier 3/4 flags, or "none identified"]
+• Mode:   [proceed / proposal first / guard off]
+```
 
-| Plane | Source | Scope |
-|-------|--------|-------|
-| Global settings | `~/.claude/settings.json allow[]` | All skills, all projects |
-| Project settings | `.claude/settings.json allow[]` | This project only |
-| Skill-declared | `SKILL.md ## Authorized Actions` | That skill only |
-| Cron-scoped | `~/.claude/cron-permissions.json` | That cron job only |
+---
 
-**Prefer skill-declared or cron-scoped grants** — they are least-privilege and don't bleed into unrelated contexts.
+## Permission planes
 
-### Skill-level authorization overrides
+`/action-permissions` manages what's authorized across four planes — from most to least privileged:
 
-Commands in `skill-permissions.json` matching an active skill's authorization are **silently passed** by the hook before the Tier 3/4 sweep runs. This lets you pre-authorize predictable actions (e.g. `git push origin main` for an automated sync skill) without touching the global allowlist.
+```
+  ┌─────────────────────────────────────────────┐  broadest
+  │  ~/.claude/settings.json  allow[]           │  all skills · all projects
+  ├─────────────────────────────────────────────┤
+  │  .claude/settings.json  allow[]             │  this project only
+  ├─────────────────────────────────────────────┤
+  │  SKILL.md  ## Authorized Actions            │  that skill only  ← preferred
+  ├─────────────────────────────────────────────┤
+  │  ~/.claude/cron-permissions.json            │  that cron only   ← preferred
+  └─────────────────────────────────────────────┘  narrowest
+```
+
+**Always grant at the narrowest scope that works.**  
+A skill-declared authorization only fires when that skill is active — it never bleeds into unrelated work.
+
+---
+
+## Outcomes
+
+| Outcome | Condition | Action |
+|---------|-----------|--------|
+| `ALLOW` | Authorization clear; action within scope | Proceed |
+| `BLOCK` | Tier 4 without explicit written approval | Stop; explain why |
+| `REVISE` | Partial alignment | Execute a safer form (draft vs. send; read vs. write) |
+| `ESCALATE` | Requires human decision | Ask — never infer |
+
+> **Tier 4 rule:** explicit written authorization required in this conversation.  
+> No implicit consent. No "they didn't say to stop." **Silence is not consent.**
+
+---
+
+## Repo contents
+
+```
+claude-intent-alignment-guard/
+├── skills/
+│   ├── intent-alignment-guard/
+│   │   └── SKILL.md          ← task-start protocol + action gate
+│   └── action-permissions/
+│       └── SKILL.md          ← permission lookup / grant / revoke
+├── hooks/
+│   └── pretool_intent_guard.py   ← PreToolUse enforcement hook (<10ms, stdlib only)
+├── skill-permissions.template.json   ← per-skill auth registry template
+├── settings-hook-snippet.json        ← hook registration snippet
+└── LICENSE
+```
 
 ---
 
 ## Installation
 
-### 1. Copy skill files
+**1. Copy the skill files**
 
+```sh
+mkdir -p ~/.claude/skills/intent-alignment-guard
+mkdir -p ~/.claude/skills/action-permissions
+mkdir -p ~/.claude/scripts
+
+cp skills/intent-alignment-guard/SKILL.md ~/.claude/skills/intent-alignment-guard/
+cp skills/action-permissions/SKILL.md     ~/.claude/skills/action-permissions/
+cp hooks/pretool_intent_guard.py          ~/.claude/scripts/
 ```
-~/.claude/skills/intent-alignment-guard/SKILL.md
-~/.claude/skills/action-permissions/SKILL.md
-```
 
-### 2. Copy the hook
-
-```
-~/.claude/scripts/pretool_intent_guard.py
-```
-
-### 3. Register the hook in `~/.claude/settings.json`
-
-Merge the contents of `settings-hook-snippet.json` into your settings, updating the path:
+**2. Register the hook in `~/.claude/settings.json`**
 
 ```json
 {
@@ -123,47 +196,38 @@ Merge the contents of `settings-hook-snippet.json` into your settings, updating 
 }
 ```
 
-### 4. Create the permissions registry (optional)
+**3. (Optional) Seed the permissions registry**
 
-Copy `skill-permissions.template.json` to `~/.claude/skill-permissions.json` and populate it, or let `/action-permissions` create and manage it for you.
+```sh
+cp skill-permissions.template.json ~/.claude/skill-permissions.json
+```
+
+Or skip this — `/action-permissions` will create and manage it for you on first use.
 
 ---
 
 ## Usage
 
-| Command | When to use |
-|---------|-------------|
-| `/intent-alignment-guard` | Start of any non-trivial task — runs the 5-question protocol |
-| `/action-permissions` | Lookup what's authorized; grant or revoke a permission for a specific skill, cron, or globally |
+| Invoke | When |
+|--------|------|
+| `/intent-alignment-guard` | Start of any non-trivial task |
+| `/action-permissions` | Lookup, grant, or revoke a permission across any plane |
 
 ---
 
-## Outcomes
+## Multi-agent note
 
-| Outcome | When |
-|---------|------|
-| **ALLOW** | Authorization clear; action within scope |
-| **BLOCK** | No clear authorization; Tier 4 without explicit written approval |
-| **REVISE** | Partial alignment — execute a safer form |
-| **ESCALATE** | Requires human decision before any action |
+When building multi-agent systems:
 
-**Tier 4 rule:** requires explicit written authorization in the conversation. No implicit consent. Silence is not consent.
-
----
-
-## Multi-agent architecture note
-
-When building multi-agent systems with IAG:
-
-- The **Actor** optimizes for task completion
-- The **Judge** (separate frontier model) optimizes only for user intent — never the same model as the actor
-- Judge sits at the **action boundary**, not at end of task
-- Scope boundaries must be documented: what can this agent touch, write, delete?
+- **Actor** — optimizes for task completion
+- **Judge** — separate frontier model; optimizes *only* for user intent; never the same model as the actor
+- Judge sits at the **action boundary**, not end of task
+- Scope boundaries must be explicit: what can this agent touch, write, delete?
 
 ---
 
 ## Requirements
 
 - [Claude Code](https://claude.ai/code)
-- Python 3.8+ (for the hook — no dependencies beyond stdlib)
-- `gh` CLI (for `/action-permissions` cron plane lookups)
+- Python 3.8+ (hook has no dependencies beyond stdlib)
+- `gh` CLI (optional — used by `/action-permissions` for cron plane lookups)
