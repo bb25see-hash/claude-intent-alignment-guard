@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"<path-to>/hooks/pretool_intent_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

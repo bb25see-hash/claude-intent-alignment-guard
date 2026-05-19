@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "description": "Per-skill pre-authorized actions. Written by /action-permissions Grant flow. Read by hooks/pretool_intent_guard.py before the Tier 4/3 sweep — matching commands are silently passed.",
+  "authorizations": [
+    {
+      "skill": "your-skill-name",
+      "action": "git push",
+      "pattern": "git push origin main",
+      "match_type": "contains",
+      "tier_override": 1,
+      "authorized_by": "user",
+      "date": "YYYY-MM-DD",
+      "context": "describe why this action is pre-authorized for this skill"
+    }
+  ]
+}
