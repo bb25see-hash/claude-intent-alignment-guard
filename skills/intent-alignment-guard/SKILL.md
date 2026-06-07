@@ -49,6 +49,14 @@ Combine risk tier and output destination into one question. Generate 2–4 optio
 - "Proposal first" — generate 5-field formal proposal; wait for approval before doing anything
 - "Skip guard" — proceed without further checks (hook still logs tier)
 
+**Option description format** — the `description` field for every option must use **bullet points**, not prose. Separate bullets with `\n`:
+```
+- [what this option does]
+- [what it affects / where output lands]
+- [key constraint, trade-off, or caveat]
+```
+2–3 bullets per option is the target. Never write a single prose sentence as a description — bullets make the trade-offs scannable at a glance.
+
 **If Q1 = "Skip IAG":** skip the context summary entirely and proceed immediately. Hook still logs tier. Ignore Q2–Q4 answers.
 
 ---
