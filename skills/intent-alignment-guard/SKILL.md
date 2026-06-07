@@ -5,6 +5,13 @@ description: "MANDATORY SELF-CHECK before any write, external, or high-risk acti
 
 # Intent Alignment Guard
 
+Two distinct functions, checked separately at the action boundary:
+
+- **Authorization** — did the user permit this action? (Tiers 1–4 below.)
+- **Quality** — does this output meet the encoded bar? (Constraint Library below.)
+
+Consent and quality are never blurred: an authorized action can still FAIL quality, and a high-quality output can still be unauthorized. Both must pass.
+
 ## Task-Start — Interactive Multiple Choice
 
 Run at the start of every non-conversational task. Skip for purely conversational turns ("thanks", "ok", "what does X mean").
@@ -13,7 +20,7 @@ Run at the start of every non-conversational task. Skip for purely conversationa
 
 ### Step 1 — All Questions (single call)
 
-Use `AskUserQuestion` with **five questions in a single call**. Generate options from what you understand about the task and codebase — do not use generic placeholders.
+Use `AskUserQuestion` with **four questions in a single call** (tool maximum is 4). Generate options from what you understand about the task and codebase — do not use generic placeholders.
 
 **Q1 — Task** (`header`: `"Task"`, 12 chars max)
 Generate 2–3 options that represent the plausible interpretations of what the user wants:
@@ -29,40 +36,37 @@ Generate 2–4 options based on what files, vaults, or systems are mentioned or 
 - "Project-wide" if multiple systems are in play
 - A narrower option ("Single file only") if a scoped interpretation is realistic
 
-**Q3 — Risk** (`header`: `"Risk"`)
-Use these fixed options:
-- "No external actions" — Tier 1/2 only (read, edit, local write)
-- "Includes Tier 3/4" — push, send, delete, external API call, visible to others
-- "Not sure yet"
+**Q3 — Risk + Data Routing** (`header`: `"Risk"`)
+Combine risk tier and output destination into one question. Generate 2–4 options that capture both where output lands AND whether any external actions are involved:
+- "Local only, no external actions" — Tier 1/2; output stays in repo/vault; no push/send/delete
+- "Local + logged/persisted" — Tier 1/2; output appended to ledger or memory file in addition to primary destination
+- "Includes Tier 3/4 action" — push, send, delete, external API, visible to others; describe the external action
+- "Multiple placements" — output goes to 2+ destinations with distinct relationships; list them
+- Only include options that are genuinely plausible; omit options that clearly don't apply
 
-**Q4 — Data Routing** (`header`: `"Data Routing"`)
-Generate 2–4 options based on where the task output will land and what role it plays there. Capture both the destination and the relationship (input-to, stored-in, replaces, augments, triggers):
-- "Stays local" — output lives only in this project/repo/vault; no downstream consumers
-- "Feeds another system" — output is consumed by a separate system (e.g., Slack message, Google Drive, external API, email); describe the relationship in the option description
-- "Logged / persisted" — output is appended to a ledger, memory file, or audit trail as a record
-- "Multiple placements" — output propagates to 2+ downstream locations with distinct relationships; list them
-- Only include options that are genuinely plausible given the task; omit options that clearly don't apply
-
-**Q5 — Pathway** (`header`: `"Pathway"`)
+**Q4 — Pathway** (`header`: `"Pathway"`)
 - "Proceed on context" *(Recommended)* — start work based on what was just confirmed
 - "Proposal first" — generate 5-field formal proposal; wait for approval before doing anything
 - "Skip guard" — proceed without further checks (hook still logs tier)
 
-**If Q1 = "Skip IAG":** skip the context summary entirely and proceed immediately. Hook still logs tier. Ignore Q2–Q5 answers.
+**If Q1 = "Skip IAG":** skip the context summary entirely and proceed immediately. Hook still logs tier. Ignore Q2–Q4 answers.
 
 ---
 
 ### Step 2 — Context Summary (always shown unless Q1 = "Skip IAG")
 
-Always display this block before starting work:
+Before starting work, scan `constraint-log.md` for entries whose `[domain]` or `How to apply` matches the current task; load their `Constraint` text into the summary. Then display this block:
 
 ```
-• Task:   [one sentence — the confirmed task from Q1]
-• Scope:  [what was confirmed in Q2]
-• Data:   [where output lands + its relationship to each destination (input-to / stored-in / replaces / augments / triggers)]
-• Risks:  [Tier 3/4 actions identified, or "none identified"]
-• Mode:   [proposal first / proceed / guard off]
+• Task:        [one sentence — the confirmed task from Q1]
+• Scope:       [what was confirmed in Q2]
+• Data:        [where output lands + its relationship to each destination (input-to / stored-in / replaces / augments / triggers)]
+• Risks:       [Tier 3/4 actions identified, or "none identified"]
+• Constraints: [matching constraint text from constraint-log.md, or "none loaded"]
+• Mode:        [proposal first / proceed / guard off]
 ```
+
+Scan `constraint-log.md` for entries matching the current task domain; surface the constraint text. If none match, show "none loaded."
 
 Then follow through:
 - **Proceed on context** → start; surface action-gate bullets before each Tier 2+ action
@@ -83,16 +87,19 @@ Before any Tier 2–4 action during task execution, use `AskUserQuestion` (singl
 - "Yes — but show proposal first"
 - "No — stop"
 
-Always show action bullets regardless of answer:
+Always show action bullets regardless of answer. The first three bullets check **authorization**; the `Quality` bullet checks the output against the **Constraint Library** — two separate checks, both must pass:
 
 ```
 • Action:     [exact action — Tier N label]
 • Authorized: [what in this conversation justifies it]
 • Skipped:    [lower-risk alternatives considered and rejected]
+• Quality:    passes  /  FAILS — constraint violated: "[constraint text]"
 • Mode:       [proposal / proceed]
 ```
 
 **If "No" or Other with blocking intent → BLOCK.** Do not proceed until authorization is explicit. Silence is not consent.
+
+**If `Quality` FAILS → outcome is REVISE or BLOCK → immediately run Constraint Capture** (below) before retrying the action.
 
 ---
 
@@ -127,10 +134,45 @@ Wait for explicit confirmation before proceeding.
 
 | Outcome | When | What to do |
 |---------|------|------------|
-| **ALLOW** | Authorization clear; action within scope | Proceed |
-| **BLOCK** | No clear authorization; Tier 4 without explicit approval | Stop; explain why |
-| **REVISE** | Partial alignment | Execute a safer form (draft vs. send, read vs. write) |
+| **ALLOW** | Authorization clear; action within scope; quality passes | Proceed |
+| **BLOCK** | No clear authorization; Tier 4 without explicit approval; or hard quality violation | Stop; explain why; run Constraint Capture if quality-driven |
+| **REVISE** | Partial alignment, or quality FAILS a loaded constraint | Execute a safer/corrected form; run Constraint Capture |
 | **ESCALATE** | Requires human decision before any action | Ask; do not infer |
+
+---
+
+## Constraint Capture
+
+Run after any **REVISE** or **BLOCK** driven by quality, or whenever the user rejects an output. Every rejection is a knowledge-creation moment — capture it so the constraint persists instead of evaporating.
+
+1. **Recognize** — state the specific gap between "looks right" and "is correct." Name what was actually wrong, not that something felt off.
+2. **Articulate** — rewrite the gap as a domain-portable constraint. Strip out task-specific nouns; phrase it so it fires on the next analogous task, not just this one.
+3. **Encode** — append the constraint to `constraint-log.md` (append-only; never overwrite an existing entry) using this template verbatim:
+
+```
+### [domain] — [constraint title]
+Date:        YYYY-MM-DD
+Trigger:     [action or output that caused the rejection]
+Constraint:  [the rule — portable, not task-specific]
+Why:         [underlying reason — domain logic, past incident, business requirement]
+How to apply:[when/where this fires in future tasks]
+Confirmed:   0  ← increment on each future task where this constraint catches something
+Status:      draft
+```
+
+**Auto-graduation:** Each future task where a constraint catches something, increment its `Confirmed` count. When `Confirmed` reaches **2** (confirmed in 2 distinct tasks), auto-promote the entry to a `memory/feedback_*.md` file using the existing feedback schema (`rule → **Why:** → **How to apply:**`). The promotion is a **copy** — do not reword or translate the constraint text. Then set `Status: graduated` in `constraint-log.md` and add it to that file's `## Graduated` section with a pointer to the new feedback file.
+
+---
+
+## Constraint Library
+
+The Constraint Library is the quality memory that the authorization tiers cannot provide. Lifecycle:
+
+- **Load** — at Step 2, matching constraints are surfaced in the `• Constraints:` bullet.
+- **Capture** — at the Action Gate, a quality FAIL triggers Constraint Capture, which appends a new entry.
+- **Graduate** — at `Confirmed: 2`, the entry is copied into durable memory and marked `graduated`.
+
+File path: `.claude/skills/intent-alignment-guard/constraint-log.md` — this is **session-capture**: fast, append-only, draft-grade. `memory/feedback_*.md` is **durable institutional knowledge** — load-bearing across all projects. A constraint earns its way from one to the other by catching real errors twice.
 
 ---
 
@@ -146,4 +188,5 @@ Wait for explicit confirmation before proceeding.
 - **Judge** (separate frontier model) optimizes only for user intent — never the same model as the actor
 - Judge sits at the **action boundary**, not at end of task
 - Four required outcomes: ALLOW / BLOCK / REVISE / ESCALATE
+- Quality layer (constraint library) sits alongside authorization — both checked at action boundary; neither substitutes for the other
 - Scope boundaries documented: what can this agent touch, write, delete?
